@@ -22,6 +22,8 @@ const cfg = (env) => ({
   inviteCode: (env && env.INVITE_CODE) || 'HWNkueX34q',
   altCode: env && env.ALT_CODE !== undefined ? env.ALT_CODE : 'odysseia',
   threshold: Number((env && env.THRESHOLD) || 1),
+  // 服务器标识校验：ID 优先（稳定），名称次要（可能为空）
+  expectGuildId: (env && env.EXPECT_GUILD_ID) || '',
   expectGuild: (env && env.EXPECT_GUILD) || '',
   pingUserId: (env && env.PING_USER_ID) || ''
 });
@@ -54,6 +56,10 @@ async function getInvite(code) {
           ok: true,
           memberCount: j.approximate_member_count ?? null,
           onlineCount: j.approximate_presence_count ?? null,
+          // guildId 比 name 稳定：实测从 Cloudflare 边缘拿到的响应里
+          // guild.name 可能为空（guildName 变 null），而 guild.id 一直有值。
+          // 所以「邀请码被改指到别的服务器」这项校验优先用 ID。
+          guildId: j.guild && j.guild.id,
           guildName: j.guild && j.guild.name,
           channelId: j.channel && j.channel.id,
           channelName: j.channel && j.channel.name,
@@ -181,7 +187,8 @@ async function check(env) {
     altMemberCount: alt.memberCount ?? null,
     altChannel: alt.channelName ?? null,
     verificationLevel: cur.verificationLevel ?? null,
-    // 邀请码被回收改指到别的服务器时能立刻看出来（只有配了 EXPECT_GUILD 才判定）
+    // 邀请码被回收改指到别的服务器时能立刻看出来（配了 EXPECT_GUILD/EXPECT_GUILD_ID 才判定）
+    guildId: cur.guildId ?? null,
     guildName: cur.guildName ?? null,
     events: []
   };
@@ -204,14 +211,19 @@ async function check(env) {
   const prevCount = prev.baseline;
   result.baseline = prevCount ?? null;
 
-  // 配了 EXPECT_GUILD 时，邀请被改指到别的服务器要能看出来（否则会误报"开放"）
-  if (cur.ok && c.expectGuild && cur.guildName && !cur.guildName.includes(c.expectGuild)) {
-    result.events.push(`GUILD_MISMATCH(${cur.guildName})`);
+  // 邀请被改指到别的服务器要能看出来（否则会误报"开放"）。
+  // 优先用 guildId 比对：实测从 Cloudflare 边缘拿到的响应里 guild.name 可能为空，
+  // 只看 name 会导致这项保护静默失效。name 仅作为次要判据（两者都配时任一不符即告警）。
+  const idMismatch = c.expectGuildId && cur.guildId && cur.guildId !== c.expectGuildId;
+  const nameMismatch = c.expectGuild && cur.guildName && !cur.guildName.includes(c.expectGuild);
+  if (cur.ok && (idMismatch || nameMismatch)) {
+    const actual = idMismatch ? `${cur.guildId}（ID 不符）` : `${cur.guildName}（名称不符）`;
+    result.events.push(`GUILD_MISMATCH(${actual})`);
     await pushAll(
       env,
       '⚠ 邀请码指向的服务器变了',
-      `期望「${c.expectGuild}」，实际「${cur.guildName}」。\n邀请码可能已被回收/改指，请人工确认。`,
-      `⚠ 邀请码指向的服务器变了：期望 ${c.expectGuild}，实际 ${cur.guildName}`
+      `期望「${c.expectGuildId || c.expectGuild}」，实际「${actual}」。\n邀请码可能已被回收/改指，请人工确认——此时"成员数上涨"已不能代表目标社区开放。`,
+      `⚠ 邀请码指向的服务器变了：期望 ${c.expectGuildId || c.expectGuild}，实际 ${actual}`
     );
     return result;
   }

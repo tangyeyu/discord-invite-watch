@@ -3,31 +3,34 @@ main = "worker.mjs"
 compatibility_date = "2026-01-01"
 
 # 每分钟检查一次。Cloudflare 的 cron 精度远好于 GitHub Actions
-# （后者实测/社区反馈普遍延迟 5～40 分钟，见 README-cloud.md 的对比）
+# （后者普遍延迟 5～40 分钟，只适合当备份）
 [triggers]
 crons = ["* * * * *"]
 
-# KV 绑定：id 必须是你自己账号下的命名空间（按账号独有，不能照抄别人的）
+# KV 绑定：id 是按账号独有的，不能照抄别人的
 # 创建： npx wrangler kv namespace create LEINA_KV
-# deploy.ps1 会自动创建并把 id 回填到这里
+# deploy.ps1 会自动创建并回填 id 到这里
 [[kv_namespaces]]
 binding = "LEINA_KV"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
-# 监控目标（可留空用代码里的默认值 = 类脑）。要盯别的服务器就改 INVITE_CODE。
-# INVITE_CODE = "HWNkueX34q"
-# ALT_CODE = "odysseia"          # 可选：第二个码（如自定义短链），留空则跳过
-# EXPECT_GUILD = "类脑"           # 可选：服务器名关键字，不匹配会告警（防邀请码被改指）
-# THRESHOLD = "1"                # 成员数上涨多少算「开放」
+# 监控目标（留空则用代码里的默认值）。要盯别的服务器就改 INVITE_CODE。
+INVITE_CODE = "HWNkueX34q"
+ALT_CODE = "odysseia"
 
-# 可选：填你自己的 Discord 用户 ID，Discord webhook 推送时会 @ 你
+# 服务器标识校验：防止邀请码被回收后改指到别的服务器（那时"成员数上涨"就失去意义）
+# ID 优先 —— 实测从 Cloudflare 边缘拿到的响应里 guild.name 可能为空，只校验名称会静默失效。
+EXPECT_GUILD_ID = "1134557553011998840"
+EXPECT_GUILD = "类脑"
+
+# Discord 推送时 @ 你（可选）
 PING_USER_ID = ""
 
-# 敏感值不要写在这里，用 secret 设置（见 README-cloud.md）：
+# 敏感值不要写在这里，用 secret：
 #   npx wrangler secret put SERVERCHAN_KEY    # Server酱 SendKey（推微信）
-#   npx wrangler secret put DISCORD_WEBHOOK   # 或 Discord webhook URL
+#   npx wrangler secret put DISCORD_WEBHOOK
 #
-# 本机注意：wrangler 需要访问 api.cloudflare.com，走代理时先设：
+# 本机代理：wrangler 需访问 api.cloudflare.com，先设
 #   $env:HTTPS_PROXY = 'http://127.0.0.1:10808'
 #   $env:HTTP_PROXY  = 'http://127.0.0.1:10808'

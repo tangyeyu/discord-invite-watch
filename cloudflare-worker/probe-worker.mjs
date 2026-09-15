@@ -169,6 +169,7 @@ if (!used) {
       via: used.via,
       memberCount: parsed?.memberCount ?? null,
       events: parsed?.events ?? null,
+      guildId: parsed?.guildId ?? null,
       guildName: parsed?.guildName ?? null,
       baseline: parsed?.baseline ?? null,
       raw: parsed ? undefined : String(last.body || '').slice(0, 200)
