@@ -49,31 +49,40 @@ if (!accountId) {
 console.log(`账号 ID: ${accountId}`);
 console.log(`Worker : ${SCRIPT}\n`);
 
+// Cloudflare API 调用。
+// 注意：chunked 解码必须在 Buffer 上做，不能先 toString 再按字符切 ——
+// 响应里含多字节 UTF-8 时按字符索引会切坏（实测：list 静默返回空列表，
+// 让人误以为没配 secret）。
 function api(method, p, body) {
   return new Promise((resolve) => {
     const payload = body !== undefined ? JSON.stringify(body) : null;
     const collect = (sock) => {
-      const bufs = [];
-      sock.setTimeout(30000, () => { sock.destroy(); resolve({ err: 'TIMEOUT' }); });
-      sock.on('data', (c) => bufs.push(c));
+      const chunks = [];
+      sock.setTimeout(30000, () => {
+        sock.destroy();
+        resolve({ err: 'TIMEOUT' });
+      });
+      sock.on('data', (c) => chunks.push(c));
       sock.on('end', () => {
-        const raw = Buffer.concat(bufs).toString('utf8');
-        const i = raw.indexOf('\r\n\r\n');
-        const head = raw.slice(0, i);
-        let b = raw.slice(i + 4);
+        const buf = Buffer.concat(chunks);
+        const headEnd = buf.indexOf('\r\n\r\n');
+        if (headEnd < 0) return resolve({ err: '响应头不完整' });
+        const head = buf.slice(0, headEnd).toString('latin1');
+        let b = buf.slice(headEnd + 4);
         if (/transfer-encoding:\s*chunked/i.test(head)) {
-          const out = []; let pos = 0;
+          const out = [];
+          let pos = 0;
           while (pos < b.length) {
             const nl = b.indexOf('\r\n', pos);
             if (nl < 0) break;
-            const size = parseInt(b.slice(pos, nl).trim(), 16);
+            const size = parseInt(b.slice(pos, nl).toString('latin1').trim(), 16);
             if (!Number.isFinite(size) || size === 0) break;
             out.push(b.slice(nl + 2, nl + 2 + size));
             pos = nl + 2 + size + 2;
           }
-          b = out.join('');
+          b = Buffer.concat(out);
         }
-        resolve({ status: Number((head.match(/^HTTP\/\d\.\d (\d+)/) || [])[1]), body: b });
+        resolve({ status: Number((head.match(/^HTTP\/\d\.\d (\d+)/) || [])[1]), body: b.toString('utf8') });
       });
       sock.on('error', (e) => resolve({ err: e.code || e.message }));
       sock.write(
@@ -85,7 +94,7 @@ function api(method, p, body) {
     const cr = http.request({ host: PROXY.host, port: PROXY.port, method: 'CONNECT', path: 'api.cloudflare.com:443', headers: { Host: 'api.cloudflare.com:443' } });
     cr.on('connect', (res, socket) => {
       if (res.statusCode !== 200) return resolve({ err: 'CONNECT ' + res.statusCode });
-      collect(tls.connect({ socket, servername: 'api.cloudflare.com' }));
+      collect(tls.connect({ socket, host: 'api.cloudflare.com', servername: 'api.cloudflare.com' }));
     });
     cr.on('error', (e) => resolve({ err: e.code || e.message }));
     cr.end();
@@ -95,15 +104,26 @@ function api(method, p, body) {
 const [, , action, value] = process.argv;
 
 if (action === 'list' || !action) {
-  const r = await api('GET', `/client/v4/accounts/${ACCOUNT}/workers/scripts/${SCRIPT}/secrets`);
+  const r = await api('GET', `/client/v4/accounts/${accountId}/workers/scripts/${SCRIPT}/secrets`);
   console.log('已设置的 secret：');
-  try {
-    const j = JSON.parse(r.body);
-    if (!j.result?.length) console.log('  （无）');
-    for (const s of j.result || []) console.log(`  - ${s.name}   类型=${s.type}   更新于 ${s.modified_on ?? '-'}`);
-  } catch {
-    console.log('  ' + (r.body || r.err || '').slice(0, 300));
+  if (r.err) {
+    // 不要静默返回空列表 —— 那会让人误以为"没配置"（实测踩过）
+    console.log(`  [X] 查询失败：${r.err}`);
+    process.exit(1);
   }
+  let j = null;
+  try {
+    j = JSON.parse(r.body);
+  } catch {
+    console.log(`  [X] 响应无法解析（HTTP ${r.status}）：${(r.body || '').slice(0, 200)}`);
+    process.exit(1);
+  }
+  if (!j.success) {
+    console.log(`  [X] API 返回失败：${JSON.stringify(j.errors || j)}`.slice(0, 300));
+    process.exit(1);
+  }
+  if (!j.result?.length) console.log('  （无 —— 尚未配置任何推送通路）');
+  for (const s of j.result || []) console.log(`  - ${s.name}   类型=${s.type}   更新于 ${s.modified_on ?? '-'}`);
   process.exit(0);
 }
 
@@ -130,7 +150,7 @@ if (action === 'discord' && !/^https:\/\/(canary\.|ptb\.)?discord(app)?\.com\/ap
 }
 
 console.log(`设置 ${name} ...`);
-const put = await api('PUT', `/client/v4/accounts/${ACCOUNT}/workers/scripts/${SCRIPT}/secrets`, {
+const put = await api('PUT', `/client/v4/accounts/${accountId}/workers/scripts/${SCRIPT}/secrets`, {
   name,
   text: value,
   type: 'secret_text'
@@ -149,7 +169,7 @@ try {
 }
 
 // --- 自校准：回读 secret 列表确认存在 ---
-const chk = await api('GET', `/client/v4/accounts/${ACCOUNT}/workers/scripts/${SCRIPT}/secrets`);
+const chk = await api('GET', `/client/v4/accounts/${accountId}/workers/scripts/${SCRIPT}/secrets`);
 let found = false;
 try {
   found = (JSON.parse(chk.body).result || []).some((s) => s.name === name);
