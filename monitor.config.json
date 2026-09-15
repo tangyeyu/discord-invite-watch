@@ -1,0 +1,14 @@
+{
+  "inviteCode": "HWNkueX34q",
+  "guildName": "类脑ΟΔΥΣΣΕΙΑ",
+  "guildId": "1134557553011998840",
+  "altCodes": ["odysseia"],
+  "pollSeconds": 120,
+  "minMemberDelta": 1,
+  "notify": {
+    "toast": true,
+    "sound": true,
+    "webhookUrl": ""
+  },
+  "openChannelIds": []
+}

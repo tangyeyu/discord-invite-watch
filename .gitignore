@@ -1,0 +1,11 @@
+# runtime artefacts
+state.json
+state.json.tmp
+logs/
+*.log
+
+# cloudflare
+cloudflare-worker/.wrangler/
+cloudflare-worker/dist/
+node_modules/
+.wrangler/

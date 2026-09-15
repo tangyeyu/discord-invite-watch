@@ -1,0 +1,26 @@
+{
+  "name": "discord-invite-watch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Watch a Discord invite that is currently paused, and alert the moment it reopens (local + Cloudflare Worker)",
+  "scripts": {
+    "check": "node monitor.mjs --simulate",
+    "once": "node monitor.mjs --once",
+    "daemon": "node monitor.mjs",
+    "baseline": "node monitor.mjs --baseline-only",
+    "status": "node check-connect.mjs",
+    "setup-push": "node cloudflare-worker/setup-push.mjs list"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "discord",
+    "invite",
+    "monitor",
+    "cloudflare-worker",
+    "cron"
+  ],
+  "license": "MIT"
+}
