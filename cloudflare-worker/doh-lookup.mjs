@@ -47,18 +47,42 @@ function httpsGetViaProxy(hostname, pathq, timeoutMs = 15000) {
 
 /** 用 DoH 查 A 记录，返回 IP 数组（失败返回 []） */
 export async function resolveViaDoh(hostname) {
-  const dohHosts = ['cloudflare-dns.com', 'dns.google', '1.1.1.1'];
+  // 多个 DoH 服务轮着试：单个服务可能瞬时不可达或被限流
+  // （实测出现过：单独跑能解析，但短时间内连续调用时某一端点失败）。
+  const dohHosts = [
+    'cloudflare-dns.com',
+    'dns.google',
+    '1.1.1.1',
+    '8.8.8.8',
+    'doh.pub',
+    'dns.alidns.com'
+  ];
+  const failures = [];
   for (const dh of dohHosts) {
     const pathq = `/dns-query?name=${encodeURIComponent(hostname)}&type=A`;
-    const r = await httpsGetViaProxy(dh, pathq);
-    if (r.err || !r.body) continue;
+    const r = await httpsGetViaProxy(dh, pathq, 12000);
+    if (r.err) {
+      failures.push(`${dh}:${r.err}`);
+      continue;
+    }
+    if (!r.body) {
+      failures.push(`${dh}:empty`);
+      continue;
+    }
     try {
       const j = JSON.parse(r.body);
-      const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+      // 有些 DoH 返回 application/dns-json 之外的结构，做好兜底
+      const answers = j.Answer || (j.result && j.result.Answer) || [];
+      const ips = answers.filter((a) => a.type === 1 || a.type === 'A').map((a) => a.data);
       if (ips.length) return ips;
+      failures.push(`${dh}:noA`);
     } catch {
-      /* 换下一个 DoH 服务 */
+      failures.push(`${dh}:parse`);
     }
+  }
+  if (failures.length) {
+    // 把失败原因挂到返回值上，便于调用方诊断（不改返回类型）
+    resolveViaDoh.lastError = failures.join(' | ');
   }
   return [];
 }

@@ -233,11 +233,30 @@ if (-not $task) {
   $enabled = $task.State -ne 'Disabled'
   W ("  任务名   : " + $task.TaskName)
   W ("  状态     : " + $task.State + $(if ($enabled) { '  (正在工作)' } else { '  (已停止，不会触发)' })) $(if ($enabled) { 'Green' } else { 'Yellow' })
-  W ("  上次运行 : " + $info.LastRunTime + "   结果=" + $info.LastTaskResult + $(if ($info.LastTaskResult -eq 0) { ' (成功)' } else { '' }))
+  # 计划任务的 Result 不是简单的 0/非0：
+  #   267009 = 当前正在运行中（SCHED_S_TASK_RUNNING）
+  #   267011 = 尚未运行过（SCHED_S_TASK_HAS_NOT_RUN）
+  # 把这两种当成"异常"会误报 —— 实测踩过（并发跑检测时正好撞上任务在跑，
+  # 于是显示"上次运行异常"，但实际任务完全正常）。
+  $code = [int]$info.LastTaskResult
+  $codeText = switch ($code) {
+    0      { '成功' }
+    267009 { '正在运行中' }
+    267011 { '尚未运行' }
+    default { "异常码 $code" }
+  }
+  W ("  上次运行 : " + $info.LastRunTime + "   结果=" + $code + " (" + $codeText + ")")
   W ("  下次运行 : " + $info.NextRunTime)
-  if (-not $enabled) { $script:Warnings += '计划任务已停止'; $script:Summary += '本机守望者：已停止' }
-  elseif ($info.LastTaskResult -ne 0) { $script:Warnings += "计划任务上次结果异常($($info.LastTaskResult))"; $script:Summary += '本机守望者：上次运行异常' }
-  else { $script:Summary += '本机守望者：正常' }
+  if (-not $enabled) {
+    $script:Warnings += '计划任务已停止'
+    $script:Summary += '本机守望者：已停止'
+  } elseif ($code -eq 0 -or $code -eq 267009 -or $code -eq 267011) {
+    # 运行中/未运行都属正常状态，不算异常
+    $script:Summary += '本机守望者：正常'
+  } else {
+    $script:Warnings += "计划任务上次结果异常($code)"
+    $script:Summary += '本机守望者：上次运行异常'
+  }
 }
 
 # ------------------------------------------------- [3] 云端哨兵
@@ -256,59 +275,56 @@ if (-not (Test-Path $wrangler)) {
     $script:Summary += '云端哨兵：未登录'
   } else {
     $url = "https://$WorkerName.$WorkerSubdomain.workers.dev"
-    # 注意：不要写 $resp + 事后读 $_ —— 在 if/else 作用域里 $_ 会失效，
-    # 实测会打印出无意义的 "HTTP 0"。改成显式捕获异常对象。
-    $statusCode = $null
-    $respContent = $null
+    $host_ = "$WorkerName.$WorkerSubdomain.workers.dev"
 
-    # ⚠ 必须先用 DoH 拿真实 IP：本机 workers.dev 被 DNS 污染
-    #   （实测被解析到 Facebook 的 31.13.67.19），直接用域名请求会 EPROTO 假故障。
-    $realIp = $null
-    try {
-      $doh = Invoke-RestMethod -Uri ("https://cloudflare-dns.com/dns-query?name=" + $WorkerName + "." + $WorkerSubdomain + ".workers.dev&type=A") `
-        -Headers @{ Accept = 'application/dns-json' } -TimeoutSec 20 -ErrorAction Stop
-      $realIp = ($doh.Answer | Where-Object { $_.type -eq 1 } | Select-Object -First 1).data
-    } catch { }
-    if ($realIp) { W ("  [i] DoH 解析真实 IP：" + $realIp + "（绕过 DNS 污染）") 'DarkGray' }
-    else { W '  [!] DoH 解析失败，将直接按域名请求（可能因污染而失败）' 'DarkGray' }
+    # 交给 node 探测：它内部用 DoH 取真实 IP 再显式建连。
+    # 为什么不在 PowerShell 里做 —— 本机 workers.dev 被 DNS 污染（实测解析到
+    # Facebook 的 IP），而 PS 5.1 无法指定「连哪个 IP / SNI 用哪个域名」；
+    # 给 Invoke-WebRequest 加 Host 头并不可靠（实测时好时坏，连到污染 IP 时
+    # 报 NO_RESPONSE，看起来像 Worker 挂了）。
+    $probeScript = Join-Path $Root 'cloudflare-worker\probe-worker.mjs'
+    $probeJson = $null
 
-    try {
-      $params = @{ Uri = $url; TimeoutSec = 30; UseBasicParsing = $true; ErrorAction = 'Stop' }
-      if ($realIp) { $params.Headers = @{ Host = "$WorkerName.$WorkerSubdomain.workers.dev" } }
-      $r = Invoke-WebRequest @params
-      $statusCode = [int]$r.StatusCode
-      $respContent = $r.Content
-      W ("  [OK] Worker 可访问：" + $url + "  (HTTP " + $statusCode + ")") 'Green'
-    } catch {
-      $ex = $_.Exception
-      if ($ex.Response -and $ex.Response.StatusCode) { $statusCode = [int]$ex.Response.StatusCode }
-      else { $statusCode = 'NO_RESPONSE' }
-      W ("  [X] Worker 不可访问：" + $url) 'Yellow'
-      W ("      HTTP " + $statusCode + "   原因：" + $ex.Message) 'DarkGray'
+    if (-not (Test-Path $probeScript)) {
+      W '  [!] 找不到 cloudflare-worker\probe-worker.mjs，跳过云端检测' 'Yellow'
+      $script:Summary += '云端哨兵：探测脚本缺失'
+    } else {
+      # 只取最后一行：node 可能往 stderr 打弃用/环境警告（npm、DEP0123 等），
+      # 用 2>&1 合并后 ConvertFrom-Json 会被污染而失败（实测踩过）。
+      # JSON 永远是最后一行，所以取尾行最稳。
+      $rawAll = (& node $probeScript $host_ $ProxyUrl 2>&1 | Out-String)
+      $rawLines = @($rawAll -split "`r?`n" | Where-Object { $_.Trim() })
+      $raw = if ($rawLines.Count) { $rawLines[-1].Trim() } else { '' }
+      try { $probeJson = $raw | ConvertFrom-Json } catch { }
+      # 完整打印原始输出（截断会掩盖真实原因）
+      W ("      调用：" + $probeScript + "  host=" + $host_ + "  proxy=" + $ProxyUrl) 'DarkGray'
+      W ("      原始输出（" + $rawLines.Count + " 行）：") 'DarkGray'
+      foreach ($ln in $rawLines) { W ("        | " + $ln) 'DarkGray' }
     }
 
-    if ($statusCode -eq 200 -and $respContent) {
-      $j = $null
-      try { $j = $respContent | ConvertFrom-Json } catch { }
-      if ($j) {
-        W ("       成员数=" + $j.memberCount + "  事件=" + ($j.events -join ',')) 'DarkGray'
-        $script:Summary += ('云端哨兵：正常（成员 ' + $j.memberCount + '）')
+    if ($probeJson) {
+      if ($probeJson.ok -and $probeJson.status -eq 200) {
+        W ("  [OK] Worker 可访问：" + $url + "  (HTTP 200, IP " + $probeJson.ip + ")") 'Green'
+        W ("       成员数=" + $probeJson.memberCount + "  事件=" + ($probeJson.events -join ',')) 'DarkGray'
+        $script:Summary += ('云端哨兵：正常（成员 ' + $probeJson.memberCount + '）')
+      } elseif ($probeJson.status -eq 500 -or ($probeJson.body -match '1101')) {
+        W ("  [X] Worker 返回 1101（无法执行）") 'Yellow'
+        W '      若这是新账号：检查 workers.dev 子域是否已注册、KV 绑定是否属于本账号' 'DarkGray'
+        W '      历史案例见 cloudflare-worker\README-cloud.md' 'DarkGray'
+        $script:Warnings += 'Worker 报 1101'
+        $script:Summary += '云端哨兵：1101 无法执行'
+      } elseif ($probeJson.status -eq 404 -or ($probeJson.body -match '1042')) {
+        W ("  [X] Worker 不存在（HTTP 404 / error 1042）") 'Yellow'
+        W ("      检查 WorkerSubdomain 配置是否正确（当前：" + $WorkerSubdomain + "）") 'DarkGray'
+        $script:Warnings += 'Worker 不存在'
+        $script:Summary += '云端哨兵：不存在'
       } else {
-        W '       响应不是预期的 JSON，可能部署有误' 'Yellow'
-        $script:Warnings += 'Worker 响应格式异常'
-        $script:Summary += '云端哨兵：响应异常'
+        # 注意：PS 5.1 不支持 ?? 空合并运算符（那是 PS 7 语法），这里用 if 代替
+        $why = if ($probeJson.error) { $probeJson.error } else { "HTTP " + $probeJson.status }
+        W ("  [X] Worker 不可用：" + $why) 'Yellow'
+        $script:Warnings += '云端哨兵不可用'
+        $script:Summary += ('云端哨兵：不可用（' + $why + '）')
       }
-    } elseif ($statusCode -eq 'NO_RESPONSE') {
-      W '      完全无响应：DNS/代理问题，或 Worker 已被删除' 'DarkGray'
-      $script:Warnings += 'Cloudflare Worker 无响应'
-      $script:Summary += '云端哨兵：无响应'
-    } else {
-      if ($statusCode -eq 500) {
-        W '      本账号已知问题：workers.dev 返回 error 1101（连最小 Worker 也一样）' 'DarkGray'
-        W '      详见 cloudflare-worker\README-cloud.md，或改用 deploy-vps.sh' 'DarkGray'
-      }
-      $script:Warnings += "Cloudflare 云端哨兵不可用(HTTP $statusCode)"
-      $script:Summary += "云端哨兵：不可用（HTTP $statusCode）"
     }
   }
   Pop-Location
