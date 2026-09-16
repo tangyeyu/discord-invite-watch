@@ -84,9 +84,25 @@ async function getInvite(code) {
       return { ok: false, status: res.status, detail };
     } catch (e) {
       // 不要吞掉异常原因：否则只会看到 "FETCH_FAILED(unreachable)"，
-      // 分不清是超时 / DNS / TLS 还是被拦（本地版已做同样区分）。
-      lastError = `${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : String(e)}`;
-      if (e && e.cause && e.cause.code) lastError += ` (${e.cause.code})`;
+      // 分不清是超时 / DNS / TLS 还是被拦。
+      // 注意：Workers 运行时里 fetch 抛出的对象结构可能和 Node 不同，
+      // 所以把能拿到的字段都尝试一遍（实测出现过 message 为空的情况）。
+      const parts = [];
+      if (e) {
+        parts.push(`name=${e.name || typeof e}`);
+        if (e.message) parts.push(`msg=${e.message}`);
+        if (e.cause) parts.push(`cause=${e.cause.code || e.cause.message || String(e.cause)}`);
+        if (!e.message && !e.cause) {
+          try {
+            parts.push(`raw=${String(e).slice(0, 120)}`);
+          } catch {
+            parts.push('raw=<unstringifiable>');
+          }
+        }
+      } else {
+        parts.push('thrown=null');
+      }
+      lastError = parts.join(' ');
       await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
     }
   }
