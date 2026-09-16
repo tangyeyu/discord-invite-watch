@@ -41,6 +41,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import tls from 'node:tls';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -181,6 +182,32 @@ function setupNetwork({ disableProxy = false } = {}) {
   const info = detectSystemProxy();
   PROXY = info.url;
   log(PROXY ? `网络：${info.source} → ${PROXY.origin}（CONNECT 隧道）` : `网络：${info.source} —— 直连 discord.com`);
+}
+
+/**
+ * 探测代理端口是否真的在监听。
+ *
+ * 为什么需要：实测踩过 —— 代理软件（v2rayN/xray）关掉后，所有请求都会失败，
+ * 而原先的诊断会把它报成「疑似限流」（因为连接错误和 404 走了同一分支），
+ * 于是日志一路显示"限流未定论"，但真正该做的是**去把代理打开**。
+ * 这两种原因的处置完全不同，必须区分。
+ */
+function probeProxyPort(timeoutMs = 3000) {
+  if (!PROXY) return Promise.resolve({ ok: true, skipped: true });
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: PROXY.hostname, port: Number(PROXY.port || 80) });
+    let done = false;
+    const finish = (v) => {
+      if (!done) {
+        done = true;
+        sock.destroy();
+        resolve(v);
+      }
+    };
+    sock.setTimeout(timeoutMs, () => finish({ ok: false, reason: '连接超时' }));
+    sock.on('connect', () => finish({ ok: true }));
+    sock.on('error', (e) => finish({ ok: false, reason: e.code || e.message }));
+  });
 }
 
 /** chunked 传输解码（Discord 常用 Transfer-Encoding: chunked，没有 Content-Length） */
@@ -650,17 +677,51 @@ async function announce(cfg, title, lines) {
 async function runOnce(cfg, state, { silentIfNoEvent = false } = {}) {
   const codes = [cfg.inviteCode, ...cfg.altCodes.filter((c) => c !== cfg.inviteCode)];
 
+  // 先探代理端口：代理没开时所有请求都会失败，此时报「疑似限流」是误导
+  // （两者处置完全不同：一个是去开代理，一个是等限流恢复）。
+  const pre = await probeProxyPort();
+  const proxyDown = pre.ok === false;
+  if (proxyDown) {
+    log(`⚠ 代理不可用：${PROXY.origin} 无法连接（${pre.reason}）`);
+    log('  → 请先启动代理软件（如 v2rayN / xray），确认其端口在监听后再重试。');
+    log('  → 本轮不报"限流"，也不改变基线（避免把网络故障误记成状态变化）。');
+    if (cfg.notify.webhookUrl) {
+      await notifyWebhook(cfg.notify.webhookUrl, `⚠ 类脑守望者：代理不可用（${PROXY.origin}，${pre.reason}）——本轮未检测，请启动代理。`);
+    }
+    return state;
+  }
+
   for (const code of codes) {
     const cur = await fetchWithHeal(code, cfg);
     const prev = state.watched[code] || null;
     const events = detectEvents(cfg, prev ? normalizePrev(prev) : null, cur);
     const snap = snapshot(cur);
 
-    state.watched[code] = { ...snap, at: new Date().toISOString() };
+    // ⚠ 取数失败时**不能**用失败快照覆盖原状态！
+    // snapshot() 在失败时不带 memberCount，直接覆盖会把有效基线抹成 undefined，
+    // 之后 delta 永远算不出来 —— 等代理恢复后真正的"开放"信号会被漏掉。
+    // （实测踩过：代理关闭期间跑了一次 --once，基线就被清空了。）
+    // 正确做法：只追加失败信息，保留上一次成功的基线。
+    if (cur.ok) {
+      state.watched[code] = { ...snap, at: new Date().toISOString() };
+    } else if (prev) {
+      state.watched[code] = {
+        ...prev,
+        lastError: snap.message || snap.httpStatus || 'unknown',
+        lastErrorAt: new Date().toISOString()
+      };
+    } else {
+      // 从未成功过，只能记录失败状态（此时没有基线可丢）
+      state.watched[code] = { ...snap, at: new Date().toISOString() };
+    }
 
     const statusText = cur.ok
       ? `OK  ${cur.guild.name}  成员=${cur.memberCount} 在线=${cur.onlineCount} 验证等级=${cur.guild.verificationLevel} 落地=${roleOfChannel(cur.channel?.id)} 过期=${cur.expiresAt ?? '永不过期'}`
-      : `不可用 HTTP=${cur.httpStatus ?? 'n/a'}${cur.notFoundConfirmed ? '（已确认失效）' : '（疑似限流，未定论）'}`;
+      : cur.httpStatus
+        ? `不可用 HTTP=${cur.httpStatus}${cur.notFoundConfirmed ? '（已确认失效）' : '（疑似限流，未定论）'}`
+        : PROXY
+          ? '不可用：连接失败（非 HTTP 错误，检查代理/网络）'
+          : '不可用：直连失败（本机直连 discord.com 不通属正常，需启用代理）';
     log(`[${code}] ${statusText}`);
 
     for (const ev of events) {
@@ -702,10 +763,19 @@ function normalizePrev(prev) {
 async function simulate(cfg) {
   const fake = (o) => ({ ok: true, httpStatus: 200, guild: { id: cfg.guildId, name: cfg.guildName, verificationLevel: 3, vanityUrlCode: 'odysseia' }, memberCount: 381862, onlineCount: 16469, channel: { id: '1134601781352079420', name: '👼｜角色文字模板' }, expiresAt: null, ...o });
 
+  // 阈值相关的用例必须**自带阈值**，不能依赖 monitor.config.json 里的当前值 ——
+  // 否则用户一改配置（例如把 minMemberDelta 调成 1），自检就会"失败"，
+  // 而那其实是配置生效的正确表现。实测踩过这个坑：测试做了对配置的隐含假设。
+  const cfgThr2 = { ...cfg, minMemberDelta: 2 };
   const cases = [
-    ['A 成员增长 → 必须 open', fake({ memberCount: 381900 }), fake({})],
-    ['A 增长 1 人（噪声）→ 不许 open', fake({ memberCount: 381863 }), fake({})],
-    ['B 落地频道切换 → 必须 info', fake({ channel: { id: '1134565363506483352', name: 'welcome' } }), fake({})],
+    ['A 成员增长 → 必须 open', fake({ memberCount: 381900 }), fake({}), cfgThr2],
+    ['A 增长 1 人（阈值 2，噪声）→ 不许 open', fake({ memberCount: 381863 }), fake({}), cfgThr2],
+    ['A2 增长 2 人（阈值 2，恰好达标）→ 必须 open', fake({ memberCount: 381864 }), fake({}), cfgThr2],
+    ['A3 增长 1 人（阈值 1）→ 必须 open', fake({ memberCount: 381863 }), fake({}), { ...cfg, minMemberDelta: 1 }],
+    // B 用例：基线必须带 channelId，否则判定里的 `previous.channelId &&` 会短路，
+    // 根本走不到"频道切换"分支（实测踩过：fake({}) 作为基线缺少 channelId，
+    // 导致这条断言永远失败 —— mock 少造了数据，不是代码有问题）。
+    ['B 落地频道切换（非 openChannelIds）→ 必须 info', fake({ channel: { id: '1139999999999999999', name: 'other' } }), fake({ channelId: '1134601781352079420' })],
     ['C 落地频道切到 openChannelIds → 必须 open', fake({ channel: { id: '1134565363506483352', name: 'welcome' } }), fake({ channelId: '1134601781352079420' })],
     ['D 从 404 变可解析 → 必须 open', fake({}), { ok: false, httpStatus: 404, notFoundConfirmed: true, attempts: [1, 2, 3] }],
     ['D 从可解析变 404 → 必须 closed', { ok: false, httpStatus: 404, notFoundConfirmed: true, attempts: [1, 2, 3] }, fake({})],
@@ -717,11 +787,13 @@ async function simulate(cfg) {
   const cfg2 = { ...cfg, openChannelIds: ['1134565363506483352'] };
   let pass = 0;
   let fail = 0;
-  for (const [name, cur, prev] of cases) {
-    const evs = detectEvents(cfg2, prev, cur);
+  for (const [name, cur, prev, caseCfg] of cases) {
+    // 每个用例可以自带配置（阈值等），没带就用默认的 cfg2
+    const evs = detectEvents(caseCfg || cfg2, prev, cur);
     const kinds = evs.map((e) => `${e.level}:${e.kind}`).join(',') || '(无)';
     const expectOpen = /必须 open/.test(name);
     const expectClosed = /必须 closed/.test(name);
+    const expectInfo = /必须 info/.test(name);
     const forbidOpen = /不许 open/.test(name);
     const forbidClosed = /不许 closed/.test(name);
     const forbidAny = /不许任何事件/.test(name);
@@ -729,6 +801,7 @@ async function simulate(cfg) {
     let ok = true;
     if (expectOpen && !evs.some((e) => e.level === 'open')) ok = false;
     if (expectClosed && !evs.some((e) => e.level === 'closed')) ok = false;
+    if (expectInfo && !evs.some((e) => e.level === 'info')) ok = false;
     if (forbidOpen && evs.some((e) => e.level === 'open')) ok = false;
     if (forbidClosed && evs.some((e) => e.level === 'closed')) ok = false;
     if (forbidAny && evs.length > 0) ok = false;

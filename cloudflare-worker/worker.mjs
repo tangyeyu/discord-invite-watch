@@ -47,6 +47,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 15000) {
 
 async function getInvite(code) {
   const url = `${API}/invites/${encodeURIComponent(code)}?with_counts=true&with_expiration=true`;
+  let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetchWithTimeout(url, { headers: { 'User-Agent': UA, Accept: 'application/json' } });
@@ -73,12 +74,23 @@ async function getInvite(code) {
         await new Promise((r) => setTimeout(r, ra ? ra * 1000 : 2500 * (attempt + 1)));
         continue;
       }
-      return { ok: false, status: res.status };
+      // 非 404/429 的 HTTP 错误：把状态码与响应体片段带出去，便于事后定位
+      let detail = '';
+      try {
+        detail = (await res.text()).slice(0, 120);
+      } catch {
+        /* 拿不到就算了 */
+      }
+      return { ok: false, status: res.status, detail };
     } catch (e) {
+      // 不要吞掉异常原因：否则只会看到 "FETCH_FAILED(unreachable)"，
+      // 分不清是超时 / DNS / TLS 还是被拦（本地版已做同样区分）。
+      lastError = `${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : String(e)}`;
+      if (e && e.cause && e.cause.code) lastError += ` (${e.cause.code})`;
       await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
     }
   }
-  return { ok: false, status: 'unreachable' };
+  return { ok: false, status: 'unreachable', detail: lastError || '未知网络错误（3 次重试均失败）' };
 }
 
 /**
@@ -279,8 +291,11 @@ async function check(env) {
       await saveState(env, s);
     }
   } else if (!cur.ok) {
-    result.events.push(`FETCH_FAILED(${cur.status})`);
-    // 取数失败不改变基线、不报警（限流也会 404）
+    // 带上原因：只写 FETCH_FAILED(unreachable) 无法区分超时/DNS/TLS/被拦
+    result.events.push(`FETCH_FAILED(status=${cur.status}${cur.detail ? ', ' + cur.detail : ''})`);
+    result.fetchOk = false;
+    // 取数失败不改变基线、不报警（限流也会 404，基线必须保住 —— 否则恢复后
+    // prevCount 为 null，delta 永远算不出来，真正的开放信号会被漏掉）
   }
 
   return result;

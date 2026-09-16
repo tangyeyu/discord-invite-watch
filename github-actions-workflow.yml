@@ -1,0 +1,71 @@
+name: leina-invite-watch
+
+# Cloud sentinel: keeps watching even when your PC is off.
+# NOTE: GitHub's runners sit outside mainland China, so they reach discord.com
+# directly and need no proxy. That is exactly why this backup path is valuable.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leina-invite-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Self-check (logic must be sound before we trust a poll)
+        run: node monitor.mjs --simulate
+
+      - name: Poll the invite
+        env:
+          # Set repo secret LEINA_WEBHOOK to get a phone push via a Discord webhook.
+          LEINA_WEBHOOK: ${{ secrets.LEINA_WEBHOOK }}
+        run: |
+          node -e "
+          const fs=require('fs');
+          const p='monitor.config.json';
+          const c=JSON.parse(fs.readFileSync(p,'utf8'));
+          if(process.env.LEINA_WEBHOOK){c.notify.webhookUrl=process.env.LEINA_WEBHOOK;}
+          c.notify.toast=false; c.notify.sound=false;
+          fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');
+          console.log('webhook configured:', Boolean(c.notify.webhookUrl));
+          "
+          node monitor.mjs --once
+
+      - name: Persist state so the next run can compare
+        run: |
+          if [ -z "$(git status --porcelain state.json)" ]; then
+            echo "state unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name  "leina-invite-watch"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # another run may have pushed meanwhile
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Leina invite watch"
+            echo ""
+            echo '```json'
+            cat state.json 2>/dev/null || echo "(no state yet)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
