@@ -5,6 +5,7 @@
   "altCodes": ["odysseia"],
   "pollSeconds": 120,
   "minMemberDelta": 1,
+  "alertCooldownMinutes": 30,
   "notify": {
     "toast": true,
     "sound": true,

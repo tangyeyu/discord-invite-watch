@@ -25,7 +25,12 @@ const cfg = (env) => ({
   // 服务器标识校验：ID 优先（稳定），名称次要（可能为空）
   expectGuildId: (env && env.EXPECT_GUILD_ID) || '',
   expectGuild: (env && env.EXPECT_GUILD) || '',
-  pingUserId: (env && env.PING_USER_ID) || ''
+  pingUserId: (env && env.PING_USER_ID) || '',
+  // 报警冷却（分钟）：同一开放窗口内只推一次。
+  // 实测事故：2026-09-17 社区开放约 27 分钟，成员数持续上涨，每分钟一轮 =>
+  // 本机+云端共推出 11 条，而 Server酱 免费版每天仅 5 条额度，
+  // 额度被前几条打光，最该收到的那条反而没到。
+  cooldownMinutes: Number((env && env.ALERT_COOLDOWN_MINUTES) || 30)
 });
 
 const KV_KEY = 'baseline';
@@ -259,6 +264,16 @@ async function check(env) {
   if (cur.ok && cur.memberCount != null && prevCount != null) {
     const delta = cur.memberCount - prevCount;
     if (delta >= c.threshold) {
+      // 冷却期内不重复推送（同一开放窗口只推一次）
+      const cooldownMs = c.cooldownMinutes * 60 * 1000;
+      const lastAlert = prev.lastAlertAt ? new Date(prev.lastAlertAt).getTime() : 0;
+      if (lastAlert && Date.now() - lastAlert < cooldownMs) {
+        const leftMin = Math.ceil((cooldownMs - (Date.now() - lastAlert)) / 60000);
+        result.events.push(`OPEN_SUPPRESSED(delta=${delta},cooldownLeft=${leftMin}min)`);
+        await saveState(env, { ...(await state(env)), baseline: cur.memberCount, at: now });
+        return result;
+      }
+
       // ★ 核心信号：恢复开放
       const ping = c.pingUserId ? `<@${c.pingUserId}> ` : '';
       const title = `★ ${c.expectGuild || '目标社区'}可能已恢复开放！`;
@@ -285,15 +300,15 @@ async function check(env) {
           c.altCode ? `短链：https://discord.gg/${c.altCode}` : '',
           ``,
           `当前在线 ${fmt(cur.onlineCount)}｜验证等级 ${fmt(cur.verificationLevel)}`,
-          `（成员数每轮上涨就会推送，直到暂停再次开启）`
+          `（${c.cooldownMinutes} 分钟内不再重复提醒，避免耗尽推送额度）`
         ].filter((x) => x !== '').join('\n'),
         msg
       );
       result.events.push(`OPEN_DETECTED(delta=${delta})`);
       result.push = r;
       await addEvent(env, { at: now, kind: 'OPEN', delta, from: prevCount, to: cur.memberCount });
-      // 报警后把基线推到当前值，避免同一波增长反复刷屏
-      await saveState(env, { ...(await state(env)), baseline: cur.memberCount, at: now });
+      // 报警后把基线推到当前值，并记录报警时间（冷却期据此计算）
+      await saveState(env, { ...(await state(env)), baseline: cur.memberCount, at: now, lastAlertAt: now });
     } else if (delta < 0) {
       // 计数下降（有人退群/清理），只记录不报警
       result.events.push(`MEMBERS_DROPPED(delta=${delta})`);

@@ -724,17 +724,36 @@ async function runOnce(cfg, state, { silentIfNoEvent = false } = {}) {
           : '不可用：直连失败（本机直连 discord.com 不通属正常，需启用代理）';
     log(`[${code}] ${statusText}`);
 
+    // ---- 报警去重（冷却期）----
+    // 实测事故：2026-09-17 社区开放约 27 分钟，成员数持续上涨，
+    // 每轮都满足"上涨≥阈值" => 本机连推 6 条、加上云端共 11 条。
+    // 而 Server酱 免费版每天只有 5 条额度 —— **警报风暴把通路自己打爆了**，
+    // 结果最该收到的那条反而没到。
+    // 所以：同一开放窗口内只推一次，冷却期内不再重复推（仍然记日志）。
+    const cooldownMs = (cfg.alertCooldownMinutes ?? 30) * 60 * 1000;
+    const lastAlert = state.lastAlertAt ? new Date(state.lastAlertAt).getTime() : 0;
+    const inCooldown = lastAlert && Date.now() - lastAlert < cooldownMs;
+
     for (const ev of events) {
       state.log.push({ at: new Date().toISOString(), code, ...ev });
       if (ev.level === 'open') {
-        await announce(cfg, `类脑可能已开放加入！（${code}）`, [
+        if (inCooldown) {
+          const leftMin = Math.ceil((cooldownMs - (Date.now() - lastAlert)) / 60000);
+          log(`  · 已检测到开放信号（${ev.kind}），但处于冷却期（还剩约 ${leftMin} 分钟），本次不重复推送`);
+          log(`    —— 避免同一开放窗口内多次推送耗尽推送额度（历史事故见代码注释）`);
+          continue;
+        }
+        await announce(cfg, `★ 类脑可能已开放加入！（${code}）`, [
           ev.text,
           `立刻试：https://discord.com/invite/${code}`,
           `短链：https://discord.gg/${cur.ok && cur.guild.vanityUrlCode ? cur.guild.vanityUrlCode : ''}`,
-          `当前成员 ${cur.memberCount ?? '?'} / 在线 ${cur.onlineCount ?? '?'}`
+          `当前成员 ${cur.memberCount ?? '?'} / 在线 ${cur.onlineCount ?? '?'}`,
+          `（${cfg.alertCooldownMinutes ?? 30} 分钟内不再重复提醒）`
         ].filter(Boolean));
+        state.lastAlertAt = new Date().toISOString();
       } else if (ev.level === 'closed') {
         await announce(cfg, `类脑邀请链接失效了（${code}）`, [ev.text]);
+        state.lastAlertAt = new Date().toISOString();
       } else if (!silentIfNoEvent) {
         log(`  · 事件(${ev.kind})：${ev.text}`);
       }
