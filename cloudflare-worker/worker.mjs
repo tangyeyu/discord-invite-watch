@@ -295,10 +295,11 @@ async function check(env) {
           `成员数上涨 +${delta}（${prevCount} → ${cur.memberCount}）`,
           `说明邀请暂停已解除、已经有人成功进群。`,
           ``,
-          `立刻加入：`,
+          `【立刻点这个链接加入】`,
           `https://discord.com/invite/${c.inviteCode}`,
           c.altCode ? `短链：https://discord.gg/${c.altCode}` : '',
           ``,
+          `注意：本服务器验证等级为最高（需要【已验证手机号】的账号）。`,
           `当前在线 ${fmt(cur.onlineCount)}｜验证等级 ${fmt(cur.verificationLevel)}`,
           `（${c.cooldownMinutes} 分钟内不再重复提醒，避免耗尽推送额度）`
         ].filter((x) => x !== '').join('\n'),
