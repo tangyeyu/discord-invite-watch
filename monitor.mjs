@@ -50,6 +50,10 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(DIR, 'monitor.config.json');
 const STATE_PATH = path.join(DIR, 'state.json');
+// 单实例锁文件：常驻模式启动时写入自身 PID。
+// tools\start-monitor.vbs 会读它做去重（但此前从未有人写过这个文件，
+// 导致计划任务每 30 分钟重启一次就多一个常驻进程，累积到 3 个抢写 state.json）。
+const PID_PATH = path.join(DIR, 'logs', 'monitor.pid');
 
 const DEFAULTS = {
   inviteCode: 'HWNkueX34q',
@@ -956,13 +960,57 @@ async function main() {
   }
 
   // 常驻轮询
+  // ── 单实例锁 ──
+  // 实测事故：tools\start-monitor.vbs 里写了「读 logs\monitor.pid 去重」的逻辑，
+  // 但**没有任何地方写过这个文件**，于是去重永远失效；加上计划任务每 30 分钟
+  // 重启一次，进程数会不断累积（实测出现过 3 个并存）。
+  // 多个实例抢写同一个 state.json，会互相覆盖状态 ——
+  // 表现为事件日志丢失、lastAlertAt 被抹掉、冷却机制失效。
+  // 所以在常驻模式启动时把自身 PID 写入文件，并检查是否已有活着的实例。
+  const pidFile = PID_PATH;
+  try {
+    if (fs.existsSync(pidFile)) {
+      const oldPid = parseInt(String(fs.readFileSync(pidFile, 'utf8')).trim(), 10);
+      if (Number.isFinite(oldPid) && oldPid !== process.pid) {
+        let alive = false;
+        try {
+          process.kill(oldPid, 0); // 信号 0 = 只探测存活，不真的发信号
+          alive = true;
+        } catch (e) {
+          alive = e && e.code === 'EPERM'; // EPERM 表示进程存在但无权限，同样算活着
+        }
+        if (alive) {
+          log(`已有常驻实例在运行（PID ${oldPid}），本实例退出以避免抢写状态。`);
+          return 0;
+        }
+        log(`发现过期的 PID 文件（PID ${oldPid} 已不存在），接管。`);
+      }
+    }
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(process.pid), 'utf8');
+    log(`常驻实例已登记：PID ${process.pid} → ${pidFile}`);
+  } catch (e) {
+    log(`⚠ 单实例锁写入失败（不影响主流程）：${e.message}`);
+  }
+
   log(`常驻模式：每 ${cfg.pollSeconds}s 检查一次。Ctrl+C 退出。`);
   let backoff = 0;
   let stop = false;
+  const cleanupPid = () => {
+    try {
+      if (fs.existsSync(pidFile)) {
+        const cur = parseInt(String(fs.readFileSync(pidFile, 'utf8')).trim(), 10);
+        if (cur === process.pid) fs.unlinkSync(pidFile); // 只删自己的，别删别人的
+      }
+    } catch {
+      /* 清理失败不影响退出 */
+    }
+  };
   process.on('SIGINT', () => {
     log('收到退出信号，收尾…');
     stop = true;
   });
+  process.on('exit', cleanupPid);
   while (!stop) {
     try {
       await runOnce(cfg, state);
@@ -977,6 +1025,7 @@ async function main() {
       await sleep(Math.min(1000, until - Date.now()));
     }
   }
+  cleanupPid();
   saveState(state);
   return 0;
 }
