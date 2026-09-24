@@ -9,6 +9,7 @@
   "notify": {
     "toast": true,
     "sound": true,
+    "autoOpenBrowser": true,
     "webhookUrl": ""
   },
   "openChannelIds": []

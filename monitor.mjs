@@ -45,7 +45,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(DIR, 'monitor.config.json');
@@ -662,13 +662,58 @@ function httpPostJson(target, payload, { timeoutMs = 20000 } = {}) {
   });
 }
 
-async function announce(cfg, title, lines) {
+/**
+ * 自动用浏览器打开一个 URL（用于"开放瞬间直接弹出邀请页"）。
+ *
+ * 为什么用系统默认方式而不是硬编码浏览器：
+ *  - 在 Windows 上用 `cmd /c start` 走系统关联，最稳；
+ *  - 但按工作区约定，境外站点要用 Chrome（默认浏览器是 Firefox 且代理行为不确定），
+ *    所以 Windows 上优先探测 Chrome 路径，找到就用它。
+ * 与本机"点开浏览器"是纯本地动作，不涉及 Discord 账号操作。
+ */
+function openInBrowser(url, { preferChrome = true } = {}) {
+  try {
+    if (process.platform === 'win32' && preferChrome) {
+      const candidates = [
+        process.env['ProgramFiles'] ? path.join(process.env['ProgramFiles'], 'Google/Chrome/Application/chrome.exe') : null,
+        process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Google/Chrome/Application/chrome.exe') : null,
+        process.env['LOCALAPPDATA'] ? path.join(process.env['LOCALAPPDATA'], 'Google/Chrome/Application/chrome.exe') : null
+      ].filter(Boolean);
+      for (const c of candidates) {
+        if (fs.existsSync(c)) {
+          spawn(c, [url], { detached: true, stdio: 'ignore' }).unref();
+          return { ok: true, how: 'chrome', exe: c };
+        }
+      }
+    }
+    // 兜底：走系统默认关联
+    if (process.platform === 'win32') {
+      spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
+      return { ok: true, how: 'default' };
+    }
+    const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    spawn(opener, [url], { detached: true, stdio: 'ignore' }).unref();
+    return { ok: true, how: opener };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+async function announce(cfg, title, lines, { openUrl = null } = {}) {
   const body = lines.join('\n');
   log(`★ ${title} —— ${body.replace(/\n/g, ' / ')}`);
   const done = [];
   if (cfg.notify.toast) done.push('toast=' + (await notifyToast(title, body)));
   if (cfg.notify.sound) done.push('sound=' + (await notifySound()));
   if (cfg.notify.webhookUrl) done.push('webhook=' + (await notifyWebhook(cfg.notify.webhookUrl, `**${title}**\n${body}`)));
+
+  // 自动打开浏览器：仅在显式传入 openUrl 且配置开启时执行
+  if (openUrl && cfg.notify.autoOpenBrowser !== false) {
+    const r = openInBrowser(openUrl);
+    done.push('browser=' + (r.ok ? `${r.how}` : `FAILED(${r.error})`));
+    if (r.ok) log(`  → 已自动打开浏览器：${openUrl}`);
+  }
+
   if (done.length) log('  通知通道：' + done.join(' '));
 }
 
@@ -743,13 +788,25 @@ async function runOnce(cfg, state, { silentIfNoEvent = false } = {}) {
           log(`    —— 避免同一开放窗口内多次推送耗尽推送额度（历史事故见代码注释）`);
           continue;
         }
-        await announce(cfg, `★ 类脑可能已开放加入！（${code}）`, [
-          ev.text,
-          `立刻试：https://discord.com/invite/${code}`,
-          `短链：https://discord.gg/${cur.ok && cur.guild.vanityUrlCode ? cur.guild.vanityUrlCode : ''}`,
-          `当前成员 ${cur.memberCount ?? '?'} / 在线 ${cur.onlineCount ?? '?'}`,
-          `（${cfg.alertCooldownMinutes ?? 30} 分钟内不再重复提醒）`
-        ].filter(Boolean));
+        await announce(
+          cfg,
+          `★ 类脑可能已开放加入！（${code}）`,
+          [
+            ev.text,
+            ``,
+            `【立刻点这个链接加入】`,
+            `https://discord.com/invite/${code}`,
+            cur.ok && cur.guild.vanityUrlCode ? `短链：https://discord.gg/${cur.guild.vanityUrlCode}` : '',
+            ``,
+            `或双击桌面/项目里的「一键加入.cmd」（走 Discord 客户端，更快）`,
+            ``,
+            `注意：本服务器验证等级为最高，加入需要【已验证手机号】的账号。`,
+            `当前成员 ${cur.memberCount ?? '?'} / 在线 ${cur.onlineCount ?? '?'}`,
+            `（${cfg.alertCooldownMinutes ?? 30} 分钟内不再重复提醒）`
+          ].filter(Boolean),
+          // 检测到开放的瞬间自动弹出邀请页（纯本地动作，不涉及账号操作）
+          { openUrl: `https://discord.com/invite/${code}` }
+        );
         state.lastAlertAt = new Date().toISOString();
       } else if (ev.level === 'closed') {
         await announce(cfg, `类脑邀请链接失效了（${code}）`, [ev.text]);
